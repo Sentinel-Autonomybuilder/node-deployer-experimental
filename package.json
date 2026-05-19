@@ -1,6 +1,6 @@
 {
   "name": "sentinel-node-manager",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "Sentinel Node Manager — desktop app for deploying and managing Sentinel dVPN nodes",
   "main": "out/main/index.cjs",
