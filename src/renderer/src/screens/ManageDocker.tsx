@@ -688,11 +688,13 @@ function SystemCard({
   // skeleton with placeholder rows so the right column is the same height
   // it'll be after data arrives.
   if (loaded && !overview?.reachable) return null;
-  const ramReserved =
+  // Docker engine pool = resources available to containers (on Windows this is
+  // the WSL2 VM allocation, below the host total). Not a per-node reservation.
+  const ramAvailable =
     overview?.totalMemoryMb
       ? `${fmtAmount(overview.totalMemoryMb / 1024, 1)} GB`
       : '—';
-  const coresReserved = overview?.ncpu ? String(overview.ncpu) : '—';
+  const coresAvailable = overview?.ncpu ? String(overview.ncpu) : '—';
   const isLinux = window.api.platform === 'linux';
   const onOpenSettings = async () => {
     const r = await window.api.docker.openSettings();
@@ -715,24 +717,24 @@ function SystemCard({
       <div className="card-header">
         <div className="card-title flex items-center gap-2">
           <MIcon name="tune" size={14} />
-          Resource reservations
+          Resources available to containers
         </div>
       </div>
       <div className="card-body flex flex-col gap-3">
         <div className="grid grid-cols-2 gap-2">
           <Stat
-            label="RAM reserved"
-            value={ramReserved}
-            help="Memory Docker Desktop has set aside for containers. Change this in Docker Desktop → Settings → Resources."
+            label="RAM available"
+            value={ramAvailable}
+            help="Memory the Docker engine makes available to containers (on Windows this is the WSL2 VM allocation, typically below the host total). Change this in Docker Desktop → Settings → Resources."
           />
           <Stat
-            label="Cores reserved"
-            value={coresReserved}
-            help="Logical CPU cores Docker Desktop has set aside for containers. Change this in Docker Desktop → Settings → Resources."
+            label="Cores available"
+            value={coresAvailable}
+            help="Logical CPU cores the Docker engine makes available to containers (on Windows this is the WSL2 VM allocation). Change this in Docker Desktop → Settings → Resources."
           />
         </div>
         <div className="text-[11px] leading-snug" style={{ color: 'var(--text-dim)' }}>
-          Bigger reservations let one node serve more concurrent users.
+          A bigger pool lets one node serve more concurrent users.
           {isLinux
             ? ' On Linux, edit /etc/docker/daemon.json and restart the daemon.'
             : ' Edit these in Docker Desktop → Settings → Resources.'}

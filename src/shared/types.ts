@@ -29,10 +29,15 @@ export type PriceMode = 'flat' | 'oracle';
  *
  * Compact field names so the JSON memo stays under Cosmos's 256-byte cap.
  *   cpu  – cpu model (truncated to 64 chars)
- *   c    – total logical cores
- *   cr   – cores reserved for the dvpn-node container
- *   r    – total RAM (MiB)
- *   rr   – RAM reserved for the dvpn-node container (MiB)
+ *   c    – total logical host cores
+ *   cr   – cores available to the dvpn-node container (Docker/WSL2 VM view)
+ *   r    – total host RAM (MiB)
+ *   rr   – RAM available to the dvpn-node container (Docker/WSL2 VM, MiB)
+ *
+ * `cr`/`rr` are "available to the container", not "reserved": the node
+ * container runs uncapped (no HostConfig Memory/NanoCpus), so these report the
+ * Docker engine's ceiling (on Windows = the WSL2 VM allocation, which is below
+ * the host total). See node-specs.ts for the full rationale.
  */
 export interface NodeSpecsSnapshot {
   cpu: string;

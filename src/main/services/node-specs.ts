@@ -31,10 +31,20 @@ import { getNode, getSSH, updateNode } from './node-manager';
  * Memo schema v1 (compact JSON, ≤ 240 bytes after `specs:v1:`):
  *   { cpu, c, cr, r, rr }
  *     cpu  – CPU model string, truncated to 64 chars
- *     c    – total logical cores
- *     cr   – cores reserved for the dvpn-node container
- *     r    – total RAM (MiB)
- *     rr   – RAM reserved for the dvpn-node container (MiB)
+ *     c    – total logical cores on the host
+ *     cr   – cores AVAILABLE to the dvpn-node container (Docker/WSL2 VM)
+ *     r    – total host RAM (MiB)
+ *     rr   – RAM AVAILABLE to the dvpn-node container (Docker/WSL2 VM, MiB)
+ *
+ * NOTE on `cr`/`rr` semantics: the node container is launched with no CPU or
+ * memory cap (see docker.ts HostConfig — no Memory/NanoCpus), so nothing is
+ * "reserved". On Windows the container runs inside the WSL2 VM, which the
+ * Docker engine sizes BELOW the host (default RAM = min(50% host, 8 GB)).
+ * `docker info` NCPU/MemTotal report that VM allocation — the real ceiling a
+ * container can draw from — which is why `cr`/`rr` mean "available to the
+ * container", not "reserved for it". On a single-purpose Linux VPS the VM ==
+ * host, so cr==c and rr==r there. If we ever set real HostConfig limits, these
+ * become true reservations and the schema should bump to v2.
  */
 
 const MEMO_PREFIX = 'specs:v1:';
@@ -77,9 +87,14 @@ export async function captureLocalSpecs(): Promise<NodeSpecsSnapshot> {
   return {
     cpu: truncateCpu(report.cpuModel),
     c: report.cpuCores,
-    // dockerOverview().ncpu is what the Docker daemon advertises as available
-    // to containers — the closest "reservation" signal we have without
-    // inspecting the running container directly.
+    // `cr`/`rr` = resources AVAILABLE to the container, not reserved for it.
+    // The node container runs with no CPU/memory cap, so its real ceiling is
+    // whatever the Docker engine exposes. On Windows that's the WSL2 VM
+    // allocation (docker info NCPU/MemTotal), which sits below the host total
+    // (default RAM = min(50% host, 8 GB)) — so `rr` < `r` there and the two
+    // fields carry distinct, meaningful info. Fall back to host totals only if
+    // the docker info probe failed (engine down), since on a single-purpose
+    // box the VM == host anyway.
     cr: dockerNcpu ?? report.cpuCores,
     r: report.memoryMb,
     rr: dockerMemMb ?? report.memoryMb,
@@ -112,16 +127,43 @@ export async function captureRemoteSpecs(creds: SSHCredentials): Promise<NodeSpe
       throw new Error('remote /proc/meminfo missing MemTotal');
     }
     const r = Math.round(parseInt(memTotalKb, 10) / 1024);
+
+    // Probe the remote Docker engine for what it actually exposes to
+    // containers (NCPU / MemTotal), mirroring what local does via
+    // dockerOverview(). `docker info` emits stable Go-template keys, so we
+    // ask for exactly the two values and parse them line-by-line. This is
+    // bail-safe: if Docker isn't reachable over SSH (not installed, perms,
+    // daemon down) we fall back to host totals — on a single-purpose VPS the
+    // engine == host, so cr==c / rr==r is the right default there anyway.
+    let dockerNcpu: number | undefined;
+    let dockerMemMb: number | undefined;
+    try {
+      // {{.NCPU}} = logical CPUs the engine sees; {{.MemTotal}} = bytes.
+      const info = await sshOne(
+        client,
+        'docker info --format "{{.NCPU}}|{{.MemTotal}}"',
+      );
+      const [ncpuStr, memBytesStr] = info.trim().split('|');
+      const ncpu = parseInt(ncpuStr, 10);
+      const memBytes = parseInt(memBytesStr, 10);
+      if (Number.isFinite(ncpu) && ncpu > 0) dockerNcpu = ncpu;
+      if (Number.isFinite(memBytes) && memBytes > 0) {
+        dockerMemMb = Math.round(memBytes / (1024 * 1024));
+      }
+    } catch (err) {
+      log.debug('remote docker info probe failed during specs capture', {
+        err: String(err),
+      });
+    }
+
     return {
       cpu: truncateCpu(cpuModel),
       c,
-      // No remote Docker reservation probe yet — assume the dvpn-node
-      // container can use the whole host on a single-purpose VPS, which
-      // is how operators actually deploy. Refine in v2 if reservations
-      // become a thing on remote hosts.
-      cr: c,
+      // `cr`/`rr` = resources AVAILABLE to the container (Docker engine view),
+      // not reserved. Falls back to host totals when the engine probe fails.
+      cr: dockerNcpu ?? c,
       r,
-      rr: r,
+      rr: dockerMemMb ?? r,
     };
   });
 }

@@ -481,9 +481,12 @@ function DockerLimitsRow({
   report: LocalSystemReport;
 }) {
   const reachable = !!docker && docker.reachable;
-  const reservedRamMb =
+  // Docker engine pool = resources available to containers (on Windows this is
+  // the WSL2 VM allocation, which sits below the host total). Not "reserved" —
+  // the node container itself runs uncapped.
+  const availRamMb =
     reachable && Number.isFinite(docker!.totalMemoryMb) ? docker!.totalMemoryMb! : 0;
-  const reservedCores =
+  const availCores =
     reachable && Number.isFinite(docker!.ncpu) ? docker!.ncpu! : 0;
   const totalRamMb = Number.isFinite(report.memoryMb) ? report.memoryMb : 0;
   const totalCores = Number.isFinite(report.cpuCores) ? report.cpuCores : 0;
@@ -505,21 +508,21 @@ function DockerLimitsRow({
       </div>
       <div className="grid grid-cols-2" style={{ gap: 0 }}>
         <DockerLimitCell
-          label="RAM reserved"
-          reserved={reservedRamMb / 1024}
+          label="RAM available"
+          value={availRamMb / 1024}
           total={totalRamMb / 1024}
           unit="GB"
           decimals={1}
-          help="Memory Docker Desktop has set aside for containers. Edit in Docker Desktop → Settings → Resources."
+          help="Memory the Docker engine makes available to containers (on Windows this is the WSL2 VM allocation, typically below the host total). Edit in Docker Desktop → Settings → Resources."
           dim={!reachable}
         />
         <DockerLimitCell
-          label="Cores reserved"
-          reserved={reservedCores}
+          label="Cores available"
+          value={availCores}
           total={totalCores}
           unit="cores"
           decimals={0}
-          help="Logical CPU cores Docker Desktop has set aside for containers. Edit in Docker Desktop → Settings → Resources."
+          help="Logical CPU cores the Docker engine makes available to containers (on Windows this is the WSL2 VM allocation). Edit in Docker Desktop → Settings → Resources."
           dim={!reachable}
           divider
         />
@@ -530,7 +533,7 @@ function DockerLimitsRow({
 
 function DockerLimitCell({
   label,
-  reserved,
+  value,
   total,
   unit,
   decimals,
@@ -539,7 +542,7 @@ function DockerLimitCell({
   divider,
 }: {
   label: string;
-  reserved: number;
+  value: number;
   total: number;
   unit: string;
   decimals: number;
@@ -550,8 +553,8 @@ function DockerLimitCell({
   const fmt = (n: number) =>
     Number.isFinite(n) && n > 0 ? n.toFixed(decimals) : '—';
   const pct =
-    total > 0 && reserved > 0
-      ? Math.max(0, Math.min(100, (reserved / total) * 100))
+    total > 0 && value > 0
+      ? Math.max(0, Math.min(100, (value / total) * 100))
       : 0;
   return (
     <div
@@ -567,7 +570,7 @@ function DockerLimitCell({
           className="text-sm font-semibold tabular-nums"
           style={{ color: dim ? 'var(--text-dim)' : 'var(--text)' }}
         >
-          {fmt(reserved)}
+          {fmt(value)}
           <span
             className="text-[11px] font-normal"
             style={{ color: 'var(--text-dim)' }}

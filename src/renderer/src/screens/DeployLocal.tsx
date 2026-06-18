@@ -670,8 +670,8 @@ function OnChainSpecsCard() {
           operator address with a <code>specs:v1</code> memo.
         </Bullet>
         <Bullet>
-          The memo carries CPU model, total cores, RAM, and the slice reserved
-          for the dvpn-node container.
+          The memo carries CPU model, total host cores and RAM, and the cores
+          and RAM available to the dvpn-node container (Docker/WSL2 VM).
         </Bullet>
         <Bullet>
           Operator-reported &mdash; not consensus-validated. Surfaced in

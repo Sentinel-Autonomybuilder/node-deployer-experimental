@@ -130,7 +130,7 @@ export function OnChainSpecs() {
               className="btn btn-secondary"
               onClick={() => void loadSystem()}
               disabled={refreshing}
-              title="Re-read CPU, RAM and Docker reservation"
+              title="Re-read CPU, RAM and Docker resource availability"
             >
               <MIcon name="refresh" size={14} />
               {refreshing ? 'Refreshing…' : 'Refresh'}
@@ -318,9 +318,9 @@ function ExplainerCard() {
           <ExplainerRow icon="memory" text="CPU model (truncated to 64 chars)." />
           <ExplainerRow
             icon="developer_board"
-            text="Total logical cores and the cores reserved for the dvpn-node container."
+            text="Total logical host cores and the cores available to the dvpn-node container (Docker/WSL2 VM)."
           />
-          <ExplainerRow icon="storage" text="Total RAM (MiB) and the RAM reserved for the container." />
+          <ExplainerRow icon="storage" text="Total host RAM (MiB) and the RAM available to the container (Docker/WSL2 VM)." />
           <ExplainerRow
             icon="receipt_long"
             text="Detection rule: fromAddress === toAddress + specs:v1: memo prefix."
@@ -513,20 +513,22 @@ function SpecsSnapshotCard({
   const totalCores = Number.isFinite(report.cpuCores) ? report.cpuCores : 0;
   const totalRamMb = Number.isFinite(report.memoryMb) ? report.memoryMb : 0;
   const dockerOk = !!docker && docker.reachable;
-  const reservedCores =
+  // Resources AVAILABLE to the container (Docker engine / WSL2 VM view), not
+  // reserved — the node container runs uncapped, so this is its real ceiling.
+  const availCores =
     dockerOk && Number.isFinite(docker!.ncpu) && docker!.ncpu! > 0
       ? docker!.ncpu!
       : totalCores;
-  const reservedRamMb =
+  const availRamMb =
     dockerOk &&
     Number.isFinite(docker!.totalMemoryMb) &&
     docker!.totalMemoryMb! > 0
       ? docker!.totalMemoryMb!
       : totalRamMb;
-  const coreRatio = totalCores > 0 ? reservedCores / totalCores : 0;
-  const ramRatio = totalRamMb > 0 ? reservedRamMb / totalRamMb : 0;
+  const coreRatio = totalCores > 0 ? availCores / totalCores : 0;
+  const ramRatio = totalRamMb > 0 ? availRamMb / totalRamMb : 0;
   const totalRamGb = totalRamMb / 1024;
-  const reservedRamGb = reservedRamMb / 1024;
+  const availRamGb = availRamMb / 1024;
   const fmtRam = (mb: number, gb: number) =>
     mb > 0 ? `${gb.toFixed(1)} GB` : '—';
   return (
@@ -576,19 +578,19 @@ function SpecsSnapshotCard({
           </div>
         </div>
 
-        {/* Reserved / total meters */}
+        {/* Available-to-container / host-total meters */}
         <div className="flex flex-col gap-2.5">
           <SpecsMeter
             icon="developer_board"
             label="Cores"
-            reserved={`${reservedCores}`}
+            available={`${availCores}`}
             total={`${totalCores}`}
             ratio={coreRatio}
           />
           <SpecsMeter
             icon="storage"
             label="RAM"
-            reserved={fmtRam(reservedRamMb, reservedRamGb)}
+            available={fmtRam(availRamMb, availRamGb)}
             total={fmtRam(totalRamMb, totalRamGb)}
             ratio={ramRatio}
           />
@@ -601,13 +603,13 @@ function SpecsSnapshotCard({
 function SpecsMeter({
   icon,
   label,
-  reserved,
+  available,
   total,
   ratio,
 }: {
   icon: string;
   label: string;
-  reserved: string;
+  available: string;
   total: string;
   ratio: number;
 }) {
@@ -629,14 +631,14 @@ function SpecsMeter({
             className="text-[8.5px] uppercase tracking-[0.12em]"
             style={{ color: 'var(--text-dim)' }}
           >
-            Reserved / Total
+            Available / Total
           </span>
           <span
             className="text-[13.3px] tabular-nums"
             style={{ color: 'var(--text-muted)' }}
           >
             <span className="font-semibold" style={{ color: 'var(--text)' }}>
-              {reserved}
+              {available}
             </span>
             <span className="opacity-60 mx-1.5">/</span>
             <span>{total}</span>
@@ -726,17 +728,17 @@ function SpecsMemoCard({
           style={{ color: 'var(--text-muted)' }}
         >
           <FieldRow k="cpu" v={snapshot.cpu} desc="CPU model (≤ 64 chars)" />
-          <FieldRow k="c" v={String(snapshot.c)} desc="Total logical cores" />
+          <FieldRow k="c" v={String(snapshot.c)} desc="Total logical host cores" />
           <FieldRow
             k="cr"
             v={String(snapshot.cr)}
-            desc="Cores reserved for container"
+            desc="Cores available to container (Docker/WSL2 VM)"
           />
-          <FieldRow k="r" v={String(snapshot.r)} desc="Total RAM (MiB)" />
+          <FieldRow k="r" v={String(snapshot.r)} desc="Total host RAM (MiB)" />
           <FieldRow
             k="rr"
             v={String(snapshot.rr)}
-            desc="RAM reserved for container (MiB)"
+            desc="RAM available to container (Docker/WSL2 VM, MiB)"
           />
         </div>
       </div>

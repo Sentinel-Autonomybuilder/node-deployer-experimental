@@ -1396,7 +1396,7 @@ function SpecsReportingPanel({
             value={<Mono>{`${Math.round(specs.r / 1024)} GiB`}</Mono>}
           />
           <KV
-            label="RAM reserved"
+            label="RAM available"
             value={<Mono>{`${Math.round(specs.rr / 1024)} GiB`}</Mono>}
           />
         </>
