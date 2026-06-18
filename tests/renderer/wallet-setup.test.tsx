@@ -81,9 +81,18 @@ describe('WalletSetup', () => {
     expect(initBtn).toBeDefined();
     await user.click(initBtn!);
 
-    // Mnemonic is revealed as 24 individual word tiles; assert the first
-    // word renders. Continue is disabled until the backup checkbox ticks.
+    // L-12: the mnemonic words are NOT rendered into the DOM until the user
+    // explicitly reveals them — pre-reveal each tile shows "••••••" so the
+    // secret never sits in the accessibility tree / DevTools. Click the
+    // "Click to reveal phrase" overlay first, then assert the first word.
     const firstWord = FAKE_MNEMONIC.split(/\s+/)[0];
+    expect(screen.queryByText(firstWord)).toBeNull();
+
+    const revealBtn = await screen.findByText(/Click to reveal phrase/i);
+    await user.click(revealBtn);
+
+    // 24 individual word tiles now render; assert the first word is present.
+    // Continue stays disabled until the backup checkbox ticks.
     const wordEl = await screen.findByText(firstWord);
     expect(wordEl).toBeDefined();
 
