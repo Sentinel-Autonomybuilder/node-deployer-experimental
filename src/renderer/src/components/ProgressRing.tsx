@@ -43,10 +43,22 @@ export function ProgressRing({
   // phase) don't cause the visible bar to flow backwards. We only allow a
   // hard reset when the target collapses all the way to 0 — the renderer
   // does this between deploys.
+  //
+  // L-12: this used to be a ref mutated *during render*, which is impure —
+  // under StrictMode double-render / concurrent discard a thrown-away render
+  // could leave the peak corrupted. The peak now lives in state and is
+  // advanced from an effect (the rAF loop reads it via a mirror ref so it
+  // doesn't need to re-subscribe on every creep).
+  const [effectiveTarget, setEffectiveTarget] = useState<number>(target);
   const peakTargetRef = useRef<number>(target);
-  if (target <= 0.05) peakTargetRef.current = 0;
-  else if (target > peakTargetRef.current) peakTargetRef.current = target;
-  const effectiveTarget = peakTargetRef.current;
+
+  useEffect(() => {
+    setEffectiveTarget((prev) => {
+      const next = target <= 0.05 ? 0 : Math.max(prev, target);
+      peakTargetRef.current = next;
+      return next;
+    });
+  }, [target]);
 
   const [shown, setShown] = useState(target);
   const rafRef = useRef<number | null>(null);

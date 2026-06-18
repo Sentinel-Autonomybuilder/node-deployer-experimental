@@ -147,10 +147,14 @@ export function NodeDetails({ id }: Props) {
   }, [status?.uptimeMs]);
   const [, setNowTick] = useState(0);
   useEffect(() => {
-    if (!hasUptime) return;
+    // L-12: also gate on `node` — after the node is removed its row is gone
+    // but a stale `liveStatuses[id]` entry can linger (until evicted), which
+    // kept `hasUptime` true and left this 1 s ticker running against a
+    // not-found screen. No node → no ticker.
+    if (!hasUptime || !node) return;
     const iv = setInterval(() => setNowTick((n) => n + 1), 1000);
     return () => clearInterval(iv);
-  }, [hasUptime]);
+  }, [hasUptime, node]);
 
   if (!node) {
     return (

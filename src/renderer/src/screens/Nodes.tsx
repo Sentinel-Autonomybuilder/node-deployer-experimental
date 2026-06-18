@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { PageHeader } from '../components/PageHeader';
 import { MIcon } from '../components/MIcon';
 import { CountryFlag } from '../components/CountryFlag';
@@ -59,9 +59,20 @@ export function Nodes() {
     [claimable],
   );
 
+  // M-16: only kick a status refresh for nodes we haven't seen before. The
+  // previous version re-fetched EVERY node on any add/remove (the memo key
+  // changes wholesale), firing an N-way RPC burst that defeats the poller's
+  // 15 s stagger every time a node appeared or was deleted. Diffing against
+  // the last-seen id set keeps it to just the genuinely-new nodes.
+  const seenNodeIds = useRef<Set<string>>(new Set());
   const nodeIdsKey = useMemo(() => nodes.map((n) => n.id).sort().join(','), [nodes]);
   useEffect(() => {
-    for (const id of nodeIdsKey.split(',').filter(Boolean)) void refreshStatus(id);
+    const current = nodeIdsKey.split(',').filter(Boolean);
+    const seen = seenNodeIds.current;
+    for (const id of current) {
+      if (!seen.has(id)) void refreshStatus(id);
+    }
+    seenNodeIds.current = new Set(current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeIdsKey]);
 

@@ -408,15 +408,17 @@ function MnemonicReveal({
               border: '1px solid var(--border)',
               borderRadius: 'var(--radius-md)',
               padding: '14px',
-              filter: revealed ? 'none' : 'blur(8px)',
               transition: 'filter 200ms ease',
-              userSelect: revealed ? 'auto' : 'none',
-              pointerEvents: revealed ? 'auto' : 'none',
             }}
           >
+            {/* L-12: render the actual words only once the user reveals them.
+              * The previous build kept every word in the DOM and merely
+              * CSS-blurred them, so the live recovery phrase was readable in
+              * DevTools / accessibility tree the whole time. Before reveal we
+              * render inert placeholder dots — no secret enters the tree. */}
             {words.map((word, i) => (
               <div
-                key={`${i}-${word}`}
+                key={`${i}-${revealed ? word : 'hidden'}`}
                 className="flex items-center gap-2 px-2.5 py-2"
                 style={{
                   background: 'var(--bg-card)',
@@ -432,9 +434,10 @@ function MnemonicReveal({
                 </span>
                 <span
                   className="font-mono text-[13px] truncate"
-                  style={{ color: 'var(--text)' }}
+                  style={{ color: revealed ? 'var(--text)' : 'var(--text-dim)' }}
+                  aria-hidden={!revealed}
                 >
-                  {word}
+                  {revealed ? word : '••••••'}
                 </span>
               </div>
             ))}

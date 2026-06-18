@@ -13,7 +13,9 @@
 export const TOKEN_LABEL = '$P2P';
 
 export const fmtAmount = (n: number, digits = 2): string =>
-  n.toLocaleString(undefined, {
+  // NaN/±Infinity render as literal "NaN"/"∞" through toLocaleString, which
+  // leaks into balances and prices. Collapse non-finite input to 0 first.
+  (Number.isFinite(n) ? n : 0).toLocaleString(undefined, {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
@@ -28,7 +30,7 @@ export const fmtToken = (n: number, digits = 2): string =>
 export const fmtDVPN = fmtAmount;
 
 export const fmtUSD = (n: number): string =>
-  n.toLocaleString(undefined, {
+  (Number.isFinite(n) ? n : 0).toLocaleString(undefined, {
     style: 'currency',
     currency: 'USD',
     maximumFractionDigits: 2,
@@ -50,6 +52,9 @@ export const shortAddr = (addr: string | null | undefined, head = 8, tail = 6): 
 
 export const relativeTime = (iso: string): string => {
   const then = new Date(iso).getTime();
+  // Invalid/unparseable timestamps yield NaN, which propagates through every
+  // branch below as "NaNm ago". Surface a stable placeholder instead.
+  if (!Number.isFinite(then)) return '—';
   const diff = Math.max(0, Date.now() - then);
   const minutes = Math.floor(diff / 60_000);
   if (minutes < 1) return 'just now';

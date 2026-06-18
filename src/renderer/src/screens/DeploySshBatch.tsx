@@ -105,10 +105,27 @@ export function DeploySshBatch() {
   const [running, setRunning] = useState(false);
   const [credsRowId, setCredsRowId] = useState<string | null>(null);
   const cancelRef = useRef(false);
+  // M-16: the deployAll loop spins up setInterval pollers that outlive the
+  // screen if the user navigates away mid-batch. Track every live timer so we
+  // can clear them on unmount, and gate state writes behind an alive flag so a
+  // resolving poll/await can't setRows after React has torn the screen down.
+  const pollTimers = useRef<Set<ReturnType<typeof setInterval>>>(new Set());
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      cancelRef.current = true;
+      for (const t of pollTimers.current) clearInterval(t);
+      pollTimers.current.clear();
+    };
+  }, []);
 
   // Subscribe to deploy progress and merge into the matching row.
   useEffect(() => {
     const unsub = window.api.deploy.onProgress((p: DeployProgress) => {
+      if (!aliveRef.current) return;
       setRows((prev) => prev.map((r) => {
         if (r.jobId !== p.jobId) return r;
         const next: Row = { ...r, phase: p.phase, percent: p.percent, message: p.message };
@@ -153,6 +170,7 @@ export function DeploySshBatch() {
   const allTestedOk = validRows.length > 0 && validRows.every((r) => r.status === 'test-ok' || r.status === 'done');
 
   const updateRow = (id: string, patch: Partial<Row>) => {
+    if (!aliveRef.current) return;
     setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   };
 
@@ -233,20 +251,24 @@ export function DeploySshBatch() {
         updateRow(row.id, { jobId, status: 'deploying' });
 
         // Wait until this row reaches a terminal phase before broadcasting next.
+        // The poller is registered in pollTimers so an unmount mid-wait clears
+        // it (and the unmount also sets cancelRef, which breaks this loop).
         await new Promise<void>((resolve) => {
           const timer = setInterval(() => {
             const cur = rowsRef.current.find((x) => x.id === row.id);
-            if (cur && cur.phase && TERMINAL_PHASES.has(cur.phase)) {
+            if (!aliveRef.current || (cur && cur.phase && TERMINAL_PHASES.has(cur.phase))) {
               clearInterval(timer);
+              pollTimers.current.delete(timer);
               resolve();
             }
           }, 400);
+          pollTimers.current.add(timer);
         });
       } catch (e) {
         updateRow(row.id, { status: 'error', message: (e as Error).message });
       }
     }
-    setRunning(false);
+    if (aliveRef.current) setRunning(false);
   };
 
   // Mirror rows into a ref so the deployAll loop can read the latest phase

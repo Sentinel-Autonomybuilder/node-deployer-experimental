@@ -337,8 +337,18 @@ export const useApp = create<AppState>((set, get) => ({
 
   liveStatuses: {},
   refreshStatus: async (id) => {
+    // M-16 (TOCTOU): `nodes.status` is a multi-second RPC. While it's in
+    // flight the fast-poller can push a *fresher* `nodes:live-status` frame
+    // into the store. Without ordering, this slow result lands last and
+    // overwrites the newer push with stale data (offline→online flicker).
+    // Snapshot a wall-clock before the await and only apply if nothing newer
+    // has written for this node since.
+    const startedAt = Date.now();
     const status = await window.api.nodes.status(id);
-    set((s) => ({ liveStatuses: { ...s.liveStatuses, [id]: status } }));
+    if ((liveStatusAt.get(id) ?? 0) <= startedAt) {
+      liveStatusAt.set(id, Date.now());
+      set((s) => ({ liveStatuses: { ...s.liveStatuses, [id]: status } }));
+    }
     return status;
   },
 
@@ -523,17 +533,15 @@ export const useApp = create<AppState>((set, get) => ({
           get().setProgress(p);
           if (p.log) get().appendDeployLog(p.jobId, p.log);
           if (p.phase === 'done') {
-            if (handledDoneJobs.has(p.jobId)) return;
-            handledDoneJobs.add(p.jobId);
-            get().pushToast({
-              title: 'Node deployed',
-              body: `${p.message} · ${p.operatorAddress?.slice(0, 12) ?? ''}…`,
-              tone: 'success',
-            });
-            // Recovery phrase ships with the terminal frame and is shown
-            // only on the Progress screen. If the user navigated away
-            // mid-deploy, force them back ONCE so they can save the
-            // mnemonic. Subsequent frames for the same job are ignored.
+            // H-7: the mnemonic-backup redirect must NOT be gated by
+            // `handledDoneJobs`. That set persists for the renderer's life, so
+            // when the main process replays its cached `done` frame after an
+            // IPC re-subscribe (no full page reload), `handledDoneJobs.has`
+            // would short-circuit and silently skip the redirect — a path
+            // where the user never sees their recovery phrase. The redirect's
+            // real one-shot guard is `seedAck` (set when the user saves the
+            // phrase), so drive it off that and run it every replayed frame
+            // until acked. Only the toast + node refresh dedupe on the set.
             const ackd = get().seedAck[p.jobId];
             if (p.mnemonicForBackup && !ackd) {
               const currentRoute = get().route;
@@ -549,6 +557,13 @@ export const useApp = create<AppState>((set, get) => ({
                 });
               }
             }
+            if (handledDoneJobs.has(p.jobId)) return;
+            handledDoneJobs.add(p.jobId);
+            get().pushToast({
+              title: 'Node deployed',
+              body: `${p.message} · ${p.operatorAddress?.slice(0, 12) ?? ''}…`,
+              tone: 'success',
+            });
             void get().refreshNodes();
           } else if (p.phase === 'error') {
             if (handledErrorJobs.has(p.jobId)) return;
@@ -593,9 +608,13 @@ export const useApp = create<AppState>((set, get) => ({
       }
       subscriptions.push(window.api.nodes.onChanged(() => void get().refreshNodes()));
       subscriptions.push(
-        window.api.nodes.onLiveStatus((u) =>
-          set((s) => ({ liveStatuses: { ...s.liveStatuses, [u.nodeId]: u.status } })),
-        ),
+        window.api.nodes.onLiveStatus((u) => {
+          // The push is the freshest real-time signal — always apply it and
+          // stamp the freshness clock so an in-flight refreshStatus() RPC
+          // can't later clobber it with a staler result (M-16 TOCTOU).
+          liveStatusAt.set(u.nodeId, Date.now());
+          set((s) => ({ liveStatuses: { ...s.liveStatuses, [u.nodeId]: u.status } }));
+        }),
       );
       subscriptions.push(window.api.events.onChanged(() => void get().refreshEvents()));
 
@@ -642,10 +661,15 @@ export const useApp = create<AppState>((set, get) => ({
         );
       }
 
-      window.addEventListener('online', () => set({ online: true }));
-      window.addEventListener('offline', () => set({ online: false }));
-
-      window.addEventListener('keydown', (e) => {
+      // H-6: register window listeners through named handlers and push their
+      // removal into `subscriptions` (the same teardown `bootstrap`'s
+      // `subscriptions.splice(0)` runs at the top). Previously these were
+      // anonymous addEventListener calls with no matching removeEventListener,
+      // so every re-bootstrap (e.g. the boot-error "Reload window" path)
+      // stacked another permanent set of global listeners.
+      const onOnline = () => set({ online: true });
+      const onOffline = () => set({ online: false });
+      const onKeydown = (e: KeyboardEvent) => {
         const mod = e.metaKey || e.ctrlKey;
         if (mod && e.key === 'r') {
           e.preventDefault();
@@ -659,7 +683,15 @@ export const useApp = create<AppState>((set, get) => ({
         if (e.key === 'Escape') {
           if (get().confirmPrompt) get().resolveConfirm(false);
         }
-      });
+      };
+      window.addEventListener('online', onOnline);
+      window.addEventListener('offline', onOffline);
+      window.addEventListener('keydown', onKeydown);
+      subscriptions.push(
+        () => window.removeEventListener('online', onOnline),
+        () => window.removeEventListener('offline', onOffline),
+        () => window.removeEventListener('keydown', onKeydown),
+      );
 
       if (hasWallet) void get().refreshWallet();
     } catch (e) {
@@ -684,3 +716,7 @@ let cliLastSeq = -1;
 // command, so the matching ok/err reply gets the same `poll` tag. Keyed by
 // source so two concurrent clients (app/shell/agent) can't cross-tag.
 const cliPendingPollBySource = new Map<string, boolean>();
+// M-16: per-node wall-clock of the last applied live-status write (push or
+// on-demand RPC). Lets `refreshStatus` discard its own result when a fresher
+// frame landed during its in-flight RPC, preventing offline→online flicker.
+const liveStatusAt = new Map<string, number>();

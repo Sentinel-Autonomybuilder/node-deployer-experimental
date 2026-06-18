@@ -75,6 +75,23 @@ export function Progress({ jobId, moniker, origin }: Props) {
 
   const onCancel = async () => {
     await window.api.deploy.cancel(jobId);
+    // H-8: the deploy may have completed in the window between the user
+    // clicking Cancel and the cancel RPC resolving. If a `done` frame carrying
+    // an unacked recovery phrase has landed, blowing away `progress` here would
+    // mean SeedPhraseModal never captures it (its capture effect derives off
+    // `progress`), and the phrase is lost forever. Re-read the live frame: if
+    // the node actually deployed with a phrase still to save, keep the user on
+    // Progress and let the seed flow take over instead of clearing.
+    const live = useApp.getState().progress;
+    if (
+      live &&
+      live.jobId === jobId &&
+      live.phase === 'done' &&
+      live.mnemonicForBackup &&
+      !useApp.getState().seedAck[jobId]
+    ) {
+      return;
+    }
     setProgress(null);
     clearDeployLog(jobId);
     navigate({ name: 'nodes' });
