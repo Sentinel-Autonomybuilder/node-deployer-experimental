@@ -40,8 +40,19 @@ export const DEFAULT_RPC_POOL: readonly string[] = [
 ];
 
 export const udvpnToDvpn = (u: string | number | bigint): number => {
-  const n = typeof u === 'bigint' ? Number(u) : Number(u);
-  return n / 1_000_000;
+  // For bigint (and integer-string) inputs, divide in integer space first so
+  // we don't blow past Number.MAX_SAFE_INTEGER before the /1e6. The original
+  // ternary collapsed both branches to Number(u) — a no-op that lost precision
+  // for balances above ~9e15 udvpn (~9e9 P2P).
+  if (typeof u === 'bigint') {
+    const whole = u / 1_000_000n;
+    const frac = Number(u % 1_000_000n) / 1_000_000;
+    return Number(whole) + frac;
+  }
+  if (typeof u === 'string' && /^-?\d+$/.test(u.trim())) {
+    return udvpnToDvpn(BigInt(u.trim()));
+  }
+  return Number(u) / 1_000_000;
 };
 
 export const dvpnToUdvpn = (d: number): string =>

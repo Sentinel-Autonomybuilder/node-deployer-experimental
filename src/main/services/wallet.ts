@@ -76,10 +76,25 @@ async function loadMnemonic(): Promise<string> {
 }
 
 async function hasMnemonicFile(): Promise<boolean> {
+  // Existence alone is not enough: a present-but-undecryptable vault (keychain
+  // rotated, profile copied to another machine, corrupt blob) would otherwise
+  // make the UI report "wallet ready" and then fail at first sign/send. Verify
+  // we can actually decrypt to a non-empty string.
   try {
-    await fs.access(mnemonicPath());
-    return true;
-  } catch {
+    if (!safeStorage.isEncryptionAvailable()) return false;
+    const buf = await fs.readFile(mnemonicPath());
+    if (!buf.length) return false;
+    const mnemonic = safeStorage.decryptString(buf);
+    return mnemonic.trim().length > 0;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code && code !== 'ENOENT') {
+      log.warn('wallet vault present but unreadable/undecryptable', { code, err: String(err) });
+    } else if (!code) {
+      // decryptString throws plain Errors (no errno) when the blob is corrupt
+      // or the key changed.
+      log.warn('wallet vault could not be decrypted', { err: String(err) });
+    }
     return false;
   }
 }
@@ -225,15 +240,23 @@ export async function logoutWallet(): Promise<void> {
 /** Query current DVPN balance for the app wallet. Silent on RPC failure. */
 export async function refreshWalletBalance(): Promise<WalletState> {
   const store = await readStore();
-  if (!store.wallet?.address) return getWallet();
+  const address = store.wallet?.address;
+  if (!address) return getWallet();
   try {
-    const balance = await fetchBalance(store.wallet.address);
-    store.wallet.balanceDVPN = balance;
-    await writeStore(store);
+    const balance = await fetchBalance(address);
+    // Re-read after the (awaited) RPC round-trip: a concurrent logout may have
+    // cleared store.wallet while fetchBalance was in flight. Mutating/returning
+    // the pre-fetch reference would resurrect a logged-out wallet or NPE.
+    const fresh = await readStore();
+    if (fresh.wallet?.address === address) {
+      fresh.wallet.balanceDVPN = balance;
+      await writeStore(fresh);
+      return { ...fresh.wallet };
+    }
   } catch (err) {
     log.warn('wallet balance refresh failed', { err: (err as Error).message });
   }
-  return store.wallet;
+  return getWallet();
 }
 
 export async function fetchBalance(address: string): Promise<number> {
@@ -260,7 +283,7 @@ export async function sendTokens(req: SendTxRequest): Promise<SendTxResult> {
     return { ok: false, error: `Recipient "${req.to}" is not a valid sent1 address.`, errorCode: 'invalid-address' };
   }
   if (!(req.amountDVPN > 0)) {
-    return { ok: false, error: 'Amount must be greater than 0.', errorCode: 'invalid-address' };
+    return { ok: false, error: 'Amount must be greater than 0.', errorCode: 'invalid-amount' };
   }
 
   // Retry on transient RPC failures: pool-wide outages, timeouts, and
@@ -335,7 +358,9 @@ export async function sendTokens(req: SendTxRequest): Promise<SendTxResult> {
           amountDVPN: -req.amountDVPN,
           txHash: result.transactionHash,
         });
-        refreshWalletBalance().catch(() => undefined);
+        refreshWalletBalance().catch((err) =>
+          log.debug('post-send balance refresh skipped', { err: String(err) }),
+        );
 
         return {
           ok: true,

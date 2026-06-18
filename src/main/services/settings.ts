@@ -7,6 +7,7 @@ import {
   DEFAULT_GAS_PRICE_UDVPN,
   DEFAULT_RPC_POOL,
 } from './chain';
+import { log } from './logger';
 import type { AppSettings } from '../../shared/types';
 
 let cache: AppSettings | null = null;
@@ -80,7 +81,18 @@ export async function getSettings(): Promise<AppSettings> {
       NODE_REFRESH_MAX_SEC,
       defaults().nodeRefreshIntervalSec,
     );
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') {
+      log.info('settings.json absent — using defaults');
+    } else {
+      // Corrupt or unreadable settings would otherwise silently revert to
+      // defaults and then be overwritten on the next updateSettings call.
+      log.error('settings.json unreadable — falling back to defaults', {
+        code: code ?? null,
+        err: String(err),
+      });
+    }
     cache = defaults();
   }
   return cache;
@@ -159,8 +171,19 @@ export async function updateSettings(patch: Partial<AppSettings>): Promise<AppSe
     );
   }
   cache = next;
-  await fs.mkdir(path.dirname(file()), { recursive: true });
-  await fs.writeFile(file(), JSON.stringify(next, null, 2), 'utf8');
+  const target = file();
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  // Atomic write (mirrors store.ts): write to a sibling temp file then rename,
+  // so a crash mid-write can't leave settings.json truncated → silent revert
+  // to defaults on next launch.
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(next, null, 2), 'utf8');
+  try {
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
   emitter.emit('changed', next);
   return next;
 }

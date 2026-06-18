@@ -20,15 +20,19 @@ export function logDir(): string {
 function ensureDir(): void {
   try {
     fs.mkdirSync(logDir(), { recursive: true });
-  } catch {
-    /* already exists */
+  } catch (err) {
+    // Cannot use `log` here — it would recurse through build()→ensureDir().
+    // recursive:true makes EEXIST impossible, so any throw is a real problem
+    // (EACCES, ENOSPC, read-only volume). Surface to stderr at least.
+    // eslint-disable-next-line no-console
+    console.error('[logger] could not create log dir', logDir(), String(err));
   }
 }
 
 // Redactor format: scrubs any field whose key matches a secret-name
 // regex, replaces value with '[redacted]'. Walks plain objects only —
 // anything more exotic (Buffer, Map, Date) is left alone.
-const SECRET_KEY_RE = /(mnemonic|password|privateKey|private[_\-]?key|passphrase|seed|secret|token)/i;
+const SECRET_KEY_RE = /(mnemonic|password|privateKey|private[_\-]?key|passphrase|seed|secret|token|backup)/i;
 function redactDeep(value: unknown, depth = 0): unknown {
   if (depth > 6 || !value || typeof value !== 'object') return value;
   if (Array.isArray(value)) return value.map((v) => redactDeep(v, depth + 1));

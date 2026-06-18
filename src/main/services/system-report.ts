@@ -1,6 +1,33 @@
 import os from 'node:os';
+import { statfs } from 'node:fs/promises';
 import type { LocalSystemReport } from '../../shared/types';
 import { dockerHealth } from './docker';
+import { log } from './logger';
+
+// Minimum free space we consider healthy for building the node image +
+// pulling layers. The first sentinel-dvpnx build is multi-GB.
+const DISK_MIN_FREE_GB = 10;
+
+/**
+ * Real free-disk-space probe. `fs.statfs` (Node 18.15+/20) gives us the
+ * filesystem holding the app's home dir, which is where Docker's data root
+ * and our config live on every supported platform. Returns null if the
+ * platform/runtime can't answer so the report can degrade gracefully rather
+ * than fabricate a number.
+ */
+async function diskFreeGb(): Promise<number | null> {
+  try {
+    const stats = await statfs(os.homedir());
+    const freeBytes = stats.bavail * stats.bsize;
+    if (!Number.isFinite(freeBytes) || freeBytes < 0) return null;
+    return Math.round(freeBytes / 1024 ** 3);
+  } catch (err) {
+    log.warn('disk free probe failed — disk health reported as unknown', {
+      err: String(err),
+    });
+    return null;
+  }
+}
 
 /**
  * Single source of truth for `LocalSystemReport`. The IPC handler and the
@@ -31,6 +58,8 @@ export async function buildLocalSystemReport(): Promise<LocalSystemReport> {
 
   const health = await dockerHealth();
   const dockerReachable = health.reachable;
+
+  const freeGb = await diskFreeGb();
   const wsl2Backend =
     platform === 'win32' && (health.desktop?.installed ?? false);
 
@@ -45,8 +74,11 @@ export async function buildLocalSystemReport(): Promise<LocalSystemReport> {
     cpuModel,
     cpuCores,
     cpuSpeedMhz,
-    diskFreeGb: 50,
-    diskOk: true,
+    // Real probe; if the platform can't answer we report 0 free but leave
+    // diskOk true so an unknown reading never blocks deploy with a false
+    // "low disk" gate.
+    diskFreeGb: freeGb ?? 0,
+    diskOk: freeGb === null ? true : freeGb >= DISK_MIN_FREE_GB,
     dockerInstalled: dockerReachable || (health.desktop?.installed ?? false),
     dockerVersion: health.version,
     dockerReachable,

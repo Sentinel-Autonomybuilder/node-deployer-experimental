@@ -6,7 +6,7 @@ import { restartPollerCadence, startPoller, stopPoller } from './services/node-m
 import { replayPendingSpecs } from './services/node-specs';
 import { refreshWalletBalance } from './services/wallet';
 import { primeDeploySettings } from './services/deploy';
-import { startUpdater } from './services/updater';
+import { startUpdater, stopUpdater } from './services/updater';
 import { getSettings, onSettingsChanged } from './services/settings';
 import { isCliServerRunning, startCliServer, stopCliServer } from './services/cli-server';
 import type { AppSettings } from '../shared/types';
@@ -52,8 +52,25 @@ crashReporter.start({
 });
 
 // Single-instance lock — avoids two app windows racing to manage the same node.
-if (!app.requestSingleInstanceLock()) {
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  // We're the second instance. Quit immediately; the primary will get a
+  // `second-instance` event and surface its window. `app.quit()` alone only
+  // schedules teardown, so guard the rest of module init from running and
+  // briefly spinning up a poller/updater that we're about to tear down.
   app.quit();
+} else {
+  // L-7: without a `second-instance` handler the user's second launch (or a
+  // file double-click that re-invokes the exe) was silently swallowed — the
+  // app would appear "not to open". Restore + focus the existing window so a
+  // re-launch behaves like a click on the taskbar icon.
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+  });
 }
 
 function createWindow(): BrowserWindow {
@@ -206,6 +223,9 @@ function installContentSecurityPolicy(): void {
 }
 
 app.whenReady().then(async () => {
+  // Second instance: the lock was denied and app.quit() is already scheduled.
+  // Bail before we initialise services we're about to tear down.
+  if (!gotSingleInstanceLock) return;
   installContentSecurityPolicy();
   log.info('app ready', {
     version: app.getVersion(),
@@ -310,6 +330,7 @@ app.on('before-quit', () => {
   log.info('app quitting');
   if (balancePoll) clearInterval(balancePoll);
   stopPoller();
+  stopUpdater();
   destroyAppTray();
   // Stop the CLI server if the user opted in (default true). Best-effort —
   // we don't await here because before-quit is synchronous; the underlying

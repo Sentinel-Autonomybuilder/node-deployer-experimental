@@ -25,8 +25,19 @@ async function load(): Promise<HostKeyMap> {
   if (cache) return cache;
   try {
     const raw = await fs.readFile(file(), 'utf8');
-    cache = JSON.parse(raw) as HostKeyMap;
-  } catch {
+    const parsed = JSON.parse(raw);
+    cache = parsed && typeof parsed === 'object' ? (parsed as HostKeyMap) : {};
+  } catch (err) {
+    // L-3: distinguish "no file yet" (expected on first run) from a real
+    // read/parse failure. A blanket empty catch silently discards every
+    // stored TOFU fingerprint when the file is merely corrupt or briefly
+    // unreadable, which would make a later MITM connection look like first
+    // contact. ENOENT → fresh start; anything else gets surfaced first.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      log.warn('failed to read known-hosts — TOFU records unavailable this run', {
+        err: String(err),
+      });
+    }
     cache = {};
   }
   return cache;

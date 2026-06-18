@@ -27,6 +27,7 @@ interface State {
 }
 
 let state: State = { stage: 'idle' };
+let initialCheckTimer: NodeJS.Timeout | null = null;
 
 export function getUpdaterState(): State {
   return state;
@@ -99,26 +100,49 @@ export function startUpdater(): void {
   });
   ipcMain.handle(IPC_UPDATER.INSTALL, async () => {
     if (state.stage !== 'ready') return { ok: false, error: 'No update ready' };
-    // Ask the user before quitting.
+    // Ask the user before quitting. L-12: `win` can be undefined when the app
+    // is running tray-only (all windows hidden/closed). The (message, options)
+    // overload of showMessageBox shows a windowless dialog; passing
+    // `undefined` as the parent is unpredictable across platforms, so branch
+    // on whether we actually have a window.
     const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
-    const choice = await dialog.showMessageBox(win, {
+    const opts: Electron.MessageBoxOptions = {
       type: 'question',
       buttons: ['Install + restart', 'Later'],
       defaultId: 0,
       cancelId: 1,
       message: `Install Sentinel Node Manager v${state.version}?`,
       detail: 'The app will quit and reopen on the new version.',
-    });
+    };
+    const choice = win
+      ? await dialog.showMessageBox(win, opts)
+      : await dialog.showMessageBox(opts);
     if (choice.response === 0) {
       setImmediate(() => autoUpdater.quitAndInstall());
     }
     return { ok: choice.response === 0 };
   });
 
-  // Quiet initial check once the window has painted.
-  setTimeout(() => {
+  // Quiet initial check once the window has painted. L-12: keep the handle so
+  // a quit during the 15 s window cancels it instead of firing a check (and a
+  // potential `error` state update / broadcast) against a tearing-down app.
+  initialCheckTimer = setTimeout(() => {
+    initialCheckTimer = null;
     autoUpdater.checkForUpdates().catch((err) => {
       update({ stage: 'error', error: String(err) });
     });
   }, 15_000);
+  initialCheckTimer.unref?.();
+}
+
+/**
+ * Cancel the pending startup check. Called from `before-quit` so a quit
+ * inside the initial 15 s delay doesn't kick off a network check against an
+ * app that's already tearing down.
+ */
+export function stopUpdater(): void {
+  if (initialCheckTimer) {
+    clearTimeout(initialCheckTimer);
+    initialCheckTimer = null;
+  }
 }

@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { log } from './logger';
 import type { AppEvent, DeployedNode, WalletState } from '../../shared/types';
 
 /**
@@ -38,27 +39,57 @@ const DEFAULT_STORE: StoreShape = {
 };
 
 let cached: StoreShape | null = null;
+// Dedup concurrent first reads: many IPC handlers call readStore() at once on
+// startup. Without this, each would hit disk + JSON.parse independently before
+// `cached` is populated. Holding the in-flight promise collapses them to one.
+let readInFlight: Promise<StoreShape> | null = null;
 
 function storePath(): string {
   return path.join(app.getPath('userData'), 'store.json');
 }
 
-export async function readStore(): Promise<StoreShape> {
-  if (cached) return cached;
+async function loadStore(): Promise<StoreShape> {
   try {
     const raw = await fs.readFile(storePath(), 'utf8');
     const parsed = JSON.parse(raw) as Partial<StoreShape>;
-    cached = {
+    return {
       wallet: parsed.wallet ?? null,
       nodes: parsed.nodes ?? [],
       events: parsed.events ?? [],
       logs: parsed.logs ?? {},
       nodeBackups: parsed.nodeBackups ?? {},
     };
-  } catch {
-    cached = structuredClone(DEFAULT_STORE);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') {
+      // First run — no store yet. Expected, not an error.
+      log.info('store.json absent — starting from defaults');
+    } else {
+      // Corrupt JSON, EACCES, or any other failure. Falling back to defaults
+      // here means an unreadable-but-present store would be silently masked and
+      // then OVERWRITTEN by the next writeStore. Loud-log so it is recoverable
+      // from the diagnostics bundle before that happens.
+      log.error('store.json unreadable — falling back to defaults (existing data at risk on next write)', {
+        code: code ?? null,
+        err: String(err),
+      });
+    }
+    return structuredClone(DEFAULT_STORE);
   }
-  return cached;
+}
+
+export async function readStore(): Promise<StoreShape> {
+  if (cached) return cached;
+  if (readInFlight) return readInFlight;
+  readInFlight = loadStore()
+    .then((s) => {
+      cached = s;
+      return s;
+    })
+    .finally(() => {
+      readInFlight = null;
+    });
+  return readInFlight;
 }
 
 /** Drop the in-memory cache so the next `readStore()` reads from disk
@@ -66,6 +97,7 @@ export async function readStore(): Promise<StoreShape> {
  *  flows like wallet logout. */
 export function resetStoreCache(): void {
   cached = null;
+  readInFlight = null;
 }
 
 export async function writeStore(next: StoreShape): Promise<void> {

@@ -169,13 +169,14 @@ async function isHealthy(url: string, expectedChainId: string): Promise<boolean>
   }
   const start = Date.now();
   let tm: Comet38Client | null = null;
+  let sg: StargateClient | null = null;
   try {
     tm = await withRpcTimeout(
       () => Comet38Client.connect(url),
       PROBE_TIMEOUT_MS,
       `connect ${url}`,
     );
-    const sg = await withRpcTimeout(
+    sg = await withRpcTimeout(
       () => StargateClient.create(tm!),
       PROBE_TIMEOUT_MS,
       `stargate ${url}`,
@@ -219,6 +220,16 @@ async function isHealthy(url: string, expectedChainId: string): Promise<boolean>
     });
     return false;
   } finally {
+    // Disconnect the StargateClient too — it owns a websocket/Tendermint
+    // client that otherwise leaks one connection per probe (every health
+    // sweep multiplies by rpcUrls.length).
+    if (sg) {
+      try {
+        sg.disconnect();
+      } catch {
+        /* already closed */
+      }
+    }
     if (tm) {
       try {
         tm.disconnect();
@@ -231,22 +242,22 @@ async function isHealthy(url: string, expectedChainId: string): Promise<boolean>
 
 export async function healthAll(): Promise<ChainHealth[]> {
   const { rpcUrls, chainId } = await getSettings();
-  const out: ChainHealth[] = [];
-  await Promise.all(
-    rpcUrls.map(async (url) => {
+  // Map (not push) so results stay aligned with rpcUrls order regardless of
+  // which probe resolves first — callers index/sort the pool by position.
+  return Promise.all(
+    rpcUrls.map(async (url): Promise<ChainHealth> => {
       await isHealthy(url, chainId);
       const c = healthCache.get(url);
-      out.push({
+      return {
         rpcUrl: url,
         reachable: !!c?.ok,
         latencyMs: c?.latencyMs,
         chainId: c?.chainId,
         blockHeight: c?.blockHeight,
         error: c?.error,
-      });
+      };
     }),
   );
-  return out;
 }
 
 export function invalidateHealthCache(): void {

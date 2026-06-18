@@ -1,11 +1,19 @@
 import os from 'node:os';
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, type WebContents } from 'electron';
 import { IPC, type LiveSystemStats } from '../../shared/types';
+import { log } from './logger';
 
 const SAMPLE_INTERVAL_MS = 1000;
 
 let timer: NodeJS.Timeout | null = null;
-let subscriberCount = 0;
+// L-10: refcount by the actual renderer that subscribed, not a raw call
+// counter. A renderer reload (or a window close without a clean toggle-off)
+// re-runs bootstrap → startLiveStats but never fires the matching
+// stopLiveStats, so the old counter climbed monotonically and the 1 Hz
+// interval leaked forever. Keying on webContents.id + a one-shot `destroyed`
+// listener makes the count self-heal when a subscriber goes away.
+const subscribers = new Map<number, WebContents>();
+const destroyHandlers = new Map<number, () => void>();
 let prevCpuTimes: ReturnType<typeof readCpuTimes> | null = null;
 
 interface CoreTimes {
@@ -64,27 +72,60 @@ function sampleAndBroadcast(): void {
   broadcast(IPC.SYSTEM_LIVE_STATS, sample);
 }
 
-export function startLiveStats(): void {
-  subscriberCount += 1;
+function ensureTimer(): void {
   if (timer) return;
   // Prime the baseline so the first user-visible sample is real, not 0.
   prevCpuTimes = readCpuTimes();
   timer = setInterval(sampleAndBroadcast, SAMPLE_INTERVAL_MS);
 }
 
-export function stopLiveStats(): void {
-  subscriberCount = Math.max(0, subscriberCount - 1);
-  if (subscriberCount > 0 || !timer) return;
-  clearInterval(timer);
-  timer = null;
-  prevCpuTimes = null;
+function dropSubscriber(id: number): void {
+  const off = destroyHandlers.get(id);
+  if (off) {
+    off();
+    destroyHandlers.delete(id);
+  }
+  subscribers.delete(id);
+  if (subscribers.size === 0 && timer) {
+    clearInterval(timer);
+    timer = null;
+    prevCpuTimes = null;
+  }
+}
+
+/**
+ * Begin (or join) the live-stats stream for a specific renderer. Pass the
+ * subscribing webContents so we can auto-release when it reloads or its
+ * window is destroyed; without a sender we fall back to a single anonymous
+ * subscription keyed to slot 0 (legacy callers).
+ */
+export function startLiveStats(sender?: WebContents): void {
+  const id = sender?.id ?? 0;
+  if (!subscribers.has(id)) {
+    subscribers.set(id, sender ?? (null as unknown as WebContents));
+    if (sender) {
+      const onGone = () => dropSubscriber(id);
+      // `destroyed` covers window close; `did-start-navigation` to a new
+      // document (reload) tears the old renderer down too. We only need the
+      // destroyed signal — a reload destroys and recreates the webContents'
+      // render frame, and the fresh bootstrap re-subscribes.
+      sender.once('destroyed', onGone);
+      destroyHandlers.set(id, () => {
+        try {
+          sender.removeListener('destroyed', onGone);
+        } catch (e) {
+          log.debug('live-stats: removeListener failed', { err: String(e) });
+        }
+      });
+    }
+  }
+  ensureTimer();
+}
+
+export function stopLiveStats(sender?: WebContents): void {
+  dropSubscriber(sender?.id ?? 0);
 }
 
 export function stopAllLiveStats(): void {
-  subscriberCount = 0;
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
-  prevCpuTimes = null;
+  for (const id of [...subscribers.keys()]) dropSubscriber(id);
 }
