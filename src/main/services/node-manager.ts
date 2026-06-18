@@ -312,24 +312,56 @@ export async function reapZombieNodes(): Promise<number> {
   let dropped = 0;
   for (const n of store.nodes) {
     const age = n.createdAt ? now - Date.parse(n.createdAt) : 0;
-    if (n.target !== 'local' || n.status !== 'loading' || age <= ZOMBIE_LOADING_AGE_MS) {
+    // Only loading nodes older than the zombie threshold are candidates.
+    // M-9: previously remote nodes were never even considered (the guard was
+    // `n.target !== 'local'`), so a remote deploy that wedged in 'loading'
+    // lived forever as a phantom. Now both targets are reaped; the liveness
+    // probe just differs (local dockerode vs. remote SSH).
+    if (n.status !== 'loading' || age <= ZOMBIE_LOADING_AGE_MS) {
       survivors.push(n);
       continue;
     }
     let isZombie = false;
     let reason = '';
-    if (!n.runtimeId) {
-      isZombie = true;
-      reason = 'no runtimeId';
-    } else {
-      const up = await withDockerTimeout(
-        () => isRunning(n.runtimeId!),
-        5_000,
-        'isRunning',
-      ).catch(() => false);
-      if (!up) {
+    if (n.target === 'local') {
+      if (!n.runtimeId) {
         isZombie = true;
-        reason = 'container not running';
+        reason = 'no runtimeId';
+      } else {
+        const up = await withDockerTimeout(
+          () => isRunning(n.runtimeId!),
+          5_000,
+          'isRunning',
+        ).catch(() => false);
+        if (!up) {
+          isZombie = true;
+          reason = 'container not running';
+        }
+      }
+    } else {
+      // Remote: probe the container over SSH if we still hold creds. No creds
+      // means we can never confirm liveness for a node that's already long
+      // past its loading deadline — treat it as a zombie so the UI clears.
+      const creds = sshKeyring.get(n.id);
+      if (!creds) {
+        isZombie = true;
+        reason = 'remote loading past deadline, no cached SSH creds';
+      } else {
+        const up = await withSSH(creds, async (client) => {
+          const sudo = await remoteSudo(client);
+          const { code, stdout } = await runRemote(
+            client,
+            sudo +
+              shellQuote(['docker', 'inspect', '-f', '{{.State.Running}}', containerName(n.id)]),
+            undefined,
+            { timeoutMs: 15_000 },
+          );
+          return code === 0 && stdout.trim() === 'true';
+        }).catch(() => false);
+        if (!up) {
+          isZombie = true;
+          reason = 'remote container not running';
+        }
       }
     }
     if (isZombie) {
@@ -340,20 +372,43 @@ export async function reapZombieNodes(): Promise<number> {
         ageMs: age,
         reason,
       });
-      if (n.runtimeId) {
-        try {
-          await removeContainer(n.runtimeId);
-        } catch {
-          /* container already gone — fine */
+      if (n.target === 'local') {
+        if (n.runtimeId) {
+          try {
+            await removeContainer(n.runtimeId);
+          } catch {
+            /* container already gone — fine */
+          }
         }
-      }
-      try {
-        await fs.rm(nodeDataDir(n.id), { recursive: true, force: true });
-      } catch (err) {
-        log.warn('zombie data dir cleanup failed', {
-          path: nodeDataDir(n.id),
-          err: (err as Error).message,
-        });
+        try {
+          await fs.rm(nodeDataDir(n.id), { recursive: true, force: true });
+        } catch (err) {
+          log.warn('zombie data dir cleanup failed', {
+            path: nodeDataDir(n.id),
+            err: (err as Error).message,
+          });
+        }
+      } else {
+        // Best-effort remote container teardown. Missing creds or an
+        // unreachable host just means the (already non-running) container
+        // is left for the operator's own cleanup — we still drop the entry.
+        const creds = sshKeyring.get(n.id);
+        if (creds) {
+          await withSSH(creds, async (client) => {
+            const sudo = await remoteSudo(client);
+            await runRemote(
+              client,
+              sudo + shellQuote(['docker', 'rm', '-f', containerName(n.id)]),
+              undefined,
+              { timeoutMs: 30_000 },
+            );
+          }).catch((err) =>
+            log.warn('remote zombie container teardown failed', {
+              id: n.id,
+              err: (err as Error).message,
+            }),
+          );
+        }
       }
       continue;
     }
@@ -421,6 +476,9 @@ export async function transition(id: string, status: NodeStatus): Promise<void> 
 
 const fastPollers = new Map<string, NodeJS.Timeout>();
 const fastPollExpiry = new Map<string, number>();
+// M-10: consecutive fast-poll failures per node. Reset on any clean tick and
+// on stop; escalates the log level once a poller is genuinely stuck.
+const fastPollFailCount = new Map<string, number>();
 const FAST_POLL_INTERVAL_MS = 4_000;
 const FAST_POLL_TIMEOUT_MS = 5 * 60_000;
 // After a node flips loading → online the renderer still needs frequent
@@ -497,8 +555,22 @@ function startFastPoll(id: string): void {
           relatedNodeId: id,
         });
       }
+      // Clean tick — reset the consecutive-failure escalation counter.
+      fastPollFailCount.delete(id);
     } catch (err) {
-      log.debug('fast-poll node failed', { id, err: (err as Error).message });
+      // M-10: was log.debug, which silently swallowed real faults (a wedged
+      // Docker client, a thrown transition, a store write error) for the whole
+      // grace window. Transient RPC/probe failures are expected here, so keep
+      // the level low but make it warn-visible and tag consecutive failures so
+      // a genuinely stuck poller is greppable in diagnostics.
+      const fails = (fastPollFailCount.get(id) ?? 0) + 1;
+      fastPollFailCount.set(id, fails);
+      const msg = (err as Error).message;
+      if (fails >= 3) {
+        log.warn('fast-poll node failing repeatedly', { id, fails, err: msg });
+      } else {
+        log.debug('fast-poll node failed', { id, fails, err: msg });
+      }
     }
   };
   // Kick a probe immediately, then on the interval. immediate probe makes the
@@ -515,6 +587,7 @@ function stopFastPoll(id: string): void {
     fastPollers.delete(id);
   }
   fastPollExpiry.delete(id);
+  fastPollFailCount.delete(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +684,14 @@ export async function startNode(id: string): Promise<void> {
 
   if (node.target === 'local') {
     const name = containerName(node.id);
+    // M-11: marks errors that must NOT be swallowed by the recreate
+    // fall-through (port conflicts, surfaced resume failures). The outer
+    // catch re-throws anything wearing this brand.
+    const PROPAGATE = Symbol('propagate');
+    const propagate = (err: Error): Error => {
+      (err as Error & { [PROPAGATE]?: true })[PROPAGATE] = true;
+      return err;
+    };
     try {
       if (
         node.runtimeId &&
@@ -644,12 +725,45 @@ export async function startNode(id: string): Promise<void> {
           republishSpecs();
           log.info('node started (local, resumed)', { id, name });
           return;
-        } catch {
-          /* container missing — fall through to recreate */
+        } catch (resumeErr) {
+          // M-11: only fall through to recreate when the existing container is
+          // genuinely gone. Other failures (a port already bound by another
+          // process, a Docker daemon error) must NOT silently fall through to
+          // runNode — that just retries the same port and surfaces a cryptic
+          // "address already in use" with no hint that a stale container or a
+          // foreign process is the real cause. Surface those clearly instead.
+          const m = (resumeErr as Error).message ?? '';
+          const notFound = /no such container|not found|404/i.test(m);
+          if (!notFound) {
+            log.warn('resume of existing container failed (not a missing-container error)', {
+              id,
+              name,
+              err: m,
+            });
+            if (/address already in use|port is already allocated/i.test(m)) {
+              throw propagate(
+                new Error(
+                  `Port ${node.port} is already in use on this computer. Stop whatever is using it (or pick a different port) and try again.`,
+                ),
+              );
+            }
+            throw propagate(resumeErr as Error);
+          }
+          log.debug('existing container gone, recreating', { id, name });
         }
       }
-    } catch {
-      /* fall through to recreate */
+    } catch (outerErr) {
+      // Re-throw anything branded for propagation (real resume failures, port
+      // conflicts). Only swallow the isRunning/inspect probe failures that
+      // legitimately mean "recreate".
+      if ((outerErr as Error & { [key: symbol]: unknown })[PROPAGATE]) throw outerErr;
+      const m = (outerErr as Error).message ?? '';
+      if (/address already in use|port is already allocated/i.test(m)) {
+        throw new Error(
+          `Port ${node.port} is already in use on this computer. Stop whatever is using it (or pick a different port) and try again.`,
+        );
+      }
+      log.debug('local start probe failed, recreating container', { id, err: m });
     }
     const runtimeId = await runNode({
       nodeId: node.id,
@@ -727,11 +841,20 @@ export async function restartNode(id: string): Promise<void> {
     if (node.runtimeId) {
       await restartContainer(node.runtimeId);
     } else {
+      // startNode already drives its own online transition + fast-poller; the
+      // shared finalize below is a no-op re-affirm in that case.
       await startNode(id);
     }
     const now = Date.now();
     startedAt.set(id, now);
-    await updateNode(id, { status: 'online', startedAt: new Date(now).toISOString() });
+    // H-1: route the final online state through transition(), not a bare
+    // updateNode(). transition() owns the fast-poller lifecycle (startFastPoll
+    // on online, stopFastPoll otherwise). A bare updateNode here leaves the
+    // poller started by transition(id,'loading') above in an unmanaged state —
+    // it self-stops on the grace window but is never re-affirmed, so a restart
+    // landing during another node's grace window could race its own teardown.
+    await updateNode(id, { startedAt: new Date(now).toISOString() });
+    await transition(id, 'online');
   } else {
     const creds = sshKeyring.get(id);
     if (!creds) throw new Error('Please enter your SSH details again to restart this remote node.');
@@ -745,7 +868,8 @@ export async function restartNode(id: string): Promise<void> {
     });
     const now = Date.now();
     startedAt.set(id, now);
-    await updateNode(id, { status: 'online', startedAt: new Date(now).toISOString() });
+    await updateNode(id, { startedAt: new Date(now).toISOString() });
+    await transition(id, 'online');
   }
 
   await addEvent({
@@ -1009,6 +1133,9 @@ export async function liveStatus(id: string): Promise<NodeLiveStatus> {
         bytesOut,
         bytesIn,
         uptimeMs,
+        // M-15: carry the freshly-read balance so the sampler records this
+        // probe's value, not the stale per-tick snapshot.
+        earningsUdvpn: Math.round(earnings * 1_000_000),
         chainHeight,
         apiLatencyMs: Date.now() - start,
         logTail: logTail.slice(-100),
@@ -1072,7 +1199,10 @@ export function startPoller(): void {
           peers: status.sessions,
           bytesIn: status.bytesIn,
           bytesOut: status.bytesOut,
-          earningsUdvpn: Math.round(node.balanceDVPN * 1_000_000),
+          // M-15: prefer the balance read on this very probe; fall back to the
+          // persisted snapshot only if the probe didn't return one.
+          earningsUdvpn:
+            status.earningsUdvpn ?? Math.round(node.balanceDVPN * 1_000_000),
           chainHeight: status.chainHeight,
           reachable: status.reachable,
         });

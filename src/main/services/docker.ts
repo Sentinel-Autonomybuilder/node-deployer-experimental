@@ -592,9 +592,20 @@ export async function runOnce(opts: {
     stdin: Boolean(opts.stdin),
   });
   const chunks: Buffer[] = [];
+  // Live demux state: docker frames can split across TCP chunks, so running
+  // stripDockerFrames() on each raw chunk independently mis-decodes a header
+  // that straddles a boundary. Demux from a rolling concat of everything seen
+  // so far and only forward the newly-revealed text to onLog.
+  let liveEmitted = 0;
   stream.on('data', (chunk: Buffer) => {
     chunks.push(chunk);
-    opts.onLog?.(stripDockerFrames(chunk));
+    if (opts.onLog) {
+      const full = stripDockerFrames(Buffer.concat(chunks));
+      if (full.length > liveEmitted) {
+        opts.onLog(full.slice(liveEmitted));
+        liveEmitted = full.length;
+      }
+    }
   });
 
   await container.start();
@@ -621,6 +632,10 @@ export async function runOnce(opts: {
       resolve({ StatusCode: 124 });
     }, timeoutMs);
   });
+  // Track the abort listener so we can detach it in finally — otherwise each
+  // runOnce leaves a live listener on a long-lived deploy-scoped signal, and
+  // they stack across keygen/configure/start steps.
+  let onAbort: (() => void) | null = null;
   const abortPromise = new Promise<{ StatusCode: number }>((resolve) => {
     if (!opts.signal) return;
     if (opts.signal.aborted) {
@@ -629,11 +644,12 @@ export async function runOnce(opts: {
       resolve({ StatusCode: -1 });
       return;
     }
-    opts.signal.addEventListener('abort', () => {
+    onAbort = () => {
       aborted = true;
       void killContainer();
       resolve({ StatusCode: -1 });
-    });
+    };
+    opts.signal.addEventListener('abort', onAbort);
   });
 
   let exit: { StatusCode?: number };
@@ -645,6 +661,7 @@ export async function runOnce(opts: {
     ])) as { StatusCode?: number };
   } finally {
     if (timer) clearTimeout(timer);
+    if (opts.signal && onAbort) opts.signal.removeEventListener('abort', onAbort);
   }
   try {
     await container.remove({ force: true });
@@ -1143,10 +1160,18 @@ function stripDockerFrames(buf: Buffer): string {
   let out = '';
   let p = 0;
   while (p < buf.length) {
-    // frame = [stream(1), _, _, _, sizeBE(4), payload]
+    // frame = [stream(1), _, _, _, sizeBE(4), payload]. Need a full 8-byte
+    // header before we can read the size — a split/partial header (or a
+    // zero-length flush frame leaving <8 bytes) would otherwise make
+    // readUInt32BE(p+4) throw RangeError, and that throw escapes the
+    // stream 'data' handler (bypassing deploy error handling).
+    if (p + 8 > buf.length) {
+      // Trailing bytes shorter than a header — not framed; emit raw.
+      return stripAnsi(out + buf.slice(p).toString('utf8'));
+    }
     const size = buf.readUInt32BE(p + 4);
-    if (Number.isNaN(size) || p + 8 + size > buf.length || size < 0 || size > 10 * 1024 * 1024) {
-      // Not a framed payload — return raw.
+    if (Number.isNaN(size) || size < 0 || size > 10 * 1024 * 1024 || p + 8 + size > buf.length) {
+      // Not a framed payload (or frame straddles this chunk) — return raw.
       return stripAnsi(buf.toString('utf8'));
     }
     out += buf.slice(p + 8, p + 8 + size).toString('utf8');

@@ -26,12 +26,54 @@ import { uploadFile, withSSH, runRemote, shellQuote } from './ssh';
 import { captureLocalSpecs, publishNodeSpecs } from './node-specs';
 import type { Client } from 'ssh2';
 import { log } from './logger';
+import { BrowserWindow } from 'electron';
+import { IPC } from '../../shared/types';
 import type {
   DeployPhase,
   DeployProgress,
   DeployRequest,
   DeployedNode,
 } from '../../shared/types';
+
+/**
+ * Broadcast a node-list-changed event to every renderer. Uses the IPC enum
+ * (NOT a raw 'nodes:changed' string) so it can never silently drift from the
+ * preload `subscribe(IPC.NODES_CHANGED)` channel.
+ */
+function broadcastNodesChanged(): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send(IPC.NODES_CHANGED, null);
+  }
+}
+
+/**
+ * Serializes all store-scrub read-modify-write cycles in this module.
+ *
+ * H-3: a deploy's async worker and `cancelDeploy()` run concurrently. When a
+ * cancel fires mid-flight, the worker's on-error/on-cancel cleanup and
+ * `purgeCancelledNode()` can both reach `readStore()`→filter→`writeStore()` at
+ * the same time. Two unlocked read-modify-write cycles last-writer-wins, which
+ * can resurrect a node one path just deleted (or drop an unrelated node added
+ * between the read and the write). Chaining every scrub through this promise
+ * makes them strictly sequential.
+ */
+let scrubChain: Promise<void> = Promise.resolve();
+
+function scrubNodeFromStore(nodeId: string): Promise<void> {
+  const run = scrubChain.then(async () => {
+    const s = await readStore();
+    const before = s.nodes.length;
+    s.nodes = s.nodes.filter((x) => x.id !== nodeId);
+    delete s.logs[nodeId];
+    delete s.nodeBackups[nodeId];
+    await writeStore(s);
+    if (s.nodes.length !== before) broadcastNodesChanged();
+  });
+  // Keep the chain alive even if this scrub throws — a rejected link would
+  // reject every future scrub. Swallow here; callers log their own context.
+  scrubChain = run.catch(() => undefined);
+  return run;
+}
 
 /**
  * Deploy orchestration.
@@ -247,12 +289,25 @@ export async function startDeploy(
   // intermediate frame omits it: cuts seed exposure in IPC traffic from O(N)
   // frames to 2, while keeping the existing renderer flow unchanged.
   let mnemonicEmitted = false;
+  // M-12: the remote spec-publish runs as a fire-and-forget IIFE that emits
+  // several more `push('done', …)` log frames after the first terminal 'done'.
+  // Each previously (a) stacked a fresh 60s lastProgress-delete timer and
+  // (b) re-attached the mnemonic to every 'done' broadcast, widening the IPC
+  // exposure window on each spec update. We still must carry the mnemonic on
+  // the FIRST 'done' frame — the renderer (Progress.tsx) reads it off the
+  // terminal frame in case it missed the earlier non-terminal one. So: carry
+  // on the first eligible frame OR the first 'done', whichever comes first,
+  // but never on a repeat 'done'. Likewise arm the cleanup timer exactly once.
+  let doneMnemonicEmitted = false;
+  let terminalTimerArmed = false;
   const push: PushFn = (phase, percent, message, log, extras = {}) => {
     if (cancelled && phase !== 'error') return;
+    const isFirstDone = phase === 'done' && !doneMnemonicEmitted;
+    if (phase === 'done') doneMnemonicEmitted = true;
     const carryMnemonic =
       phase !== 'error' &&
       phase !== 'cancelled' &&
-      (!mnemonicEmitted || phase === 'done');
+      (!mnemonicEmitted || isFirstDone);
     if (carryMnemonic) mnemonicEmitted = true;
     const progress: DeployProgress = {
       jobId,
@@ -267,7 +322,8 @@ export async function startDeploy(
       ...extras,
     };
     lastProgress.set(jobId, progress);
-    if (TERMINAL_PHASES.has(phase)) {
+    if (TERMINAL_PHASES.has(phase) && !terminalTimerArmed) {
+      terminalTimerArmed = true;
       setTimeout(() => lastProgress.delete(jobId), 60_000).unref?.();
     }
     onProgress(progress);
@@ -383,17 +439,10 @@ export async function startDeploy(
         });
         // Drop the failed node from the inventory so the user isn't left
         // with a zombie entry. Any transient backup / logs / metrics for
-        // the nodeId are purged too.
+        // the nodeId are purged too. Routed through the serialized scrub
+        // (H-3) so it can't race a concurrent cancel's cleanup.
         try {
-          const s = await readStore();
-          s.nodes = s.nodes.filter((x) => x.id !== nodeId);
-          delete s.logs[nodeId];
-          delete s.nodeBackups[nodeId];
-          await writeStore(s);
-          const { BrowserWindow } = await import('electron');
-          for (const win of BrowserWindow.getAllWindows()) {
-            win.webContents.send('nodes:changed', null);
-          }
+          await scrubNodeFromStore(nodeId);
         } catch (cleanupErr) {
           log.warn('failed-deploy cleanup errored', { err: String(cleanupErr) });
         }
@@ -459,16 +508,9 @@ async function purgeCancelledNode(nodeId: string): Promise<void> {
     log.warn('cancelled-deploy cleanup failed', { nodeId, err: String(err) });
     // Belt-and-braces: even if removeNode threw mid-way, scrub the store
     // entry so the renderer doesn't keep showing a phantom 'loading' node.
+    // Serialized (H-3) so it can't race the on-error cleanup path.
     try {
-      const s = await readStore();
-      s.nodes = s.nodes.filter((x) => x.id !== nodeId);
-      delete s.logs[nodeId];
-      delete s.nodeBackups[nodeId];
-      await writeStore(s);
-      const { BrowserWindow } = await import('electron');
-      for (const win of BrowserWindow.getAllWindows()) {
-        win.webContents.send('nodes:changed', null);
-      }
+      await scrubNodeFromStore(nodeId);
     } catch (storeErr) {
       log.warn('cancelled-deploy store scrub failed', { nodeId, err: String(storeErr) });
     }

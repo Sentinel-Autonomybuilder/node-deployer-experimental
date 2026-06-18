@@ -32,6 +32,7 @@ import {
 } from '../../shared/types';
 import { testSSHConnection } from './ssh';
 import { forgetHostKey } from './host-keys';
+import { vSSHCredentials } from '../validate';
 import {
   startDeploy,
   cancelDeploy,
@@ -497,14 +498,17 @@ export const MAIN_COMMANDS: MainCliCommand[] = [
       { name: 'passphrase', kind: 'flag', describe: 'Key passphrase.' },
     ],
     exec: (p) => {
-      const creds: SSHCredentials = {
+      // M-13: validate through the same checker the IPC path uses, instead of
+      // constructing SSHCredentials raw. Catches bad hosts/ports/usernames and
+      // bounds the credential field sizes before they reach the ssh2 client.
+      const creds = vSSHCredentials({
         host: requireFlag(p, 'host'),
         port: numberFlag(p, 'port') ?? 22,
         username: requireFlag(p, 'username'),
         password: optionalFlag(p, 'password'),
         privateKey: optionalFlag(p, 'privateKey'),
         passphrase: optionalFlag(p, 'passphrase'),
-      };
+      });
       return testSSHConnection(creds);
     },
   },
@@ -550,6 +554,19 @@ export const MAIN_COMMANDS: MainCliCommand[] = [
       if (!isVpnServiceType(service))
         throw new Error('--service must be "wireguard" or "v2ray"');
       const sshRaw = optionalFlag(p, 'ssh');
+      // M-13: a remote deploy's SSH blob arrives as a raw JSON string from the
+      // CLI. Parse then validate through the shared checker — the same gate the
+      // IPC DEPLOY_START handler applies — so malformed creds can't slip past.
+      let ssh: SSHCredentials | undefined;
+      if (sshRaw) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(sshRaw);
+        } catch {
+          throw new Error('--ssh must be valid JSON for SSHCredentials');
+        }
+        ssh = vSSHCredentials(parsed);
+      }
       const req: DeployRequest = {
         target,
         moniker: requireFlag(p, 'moniker'),
@@ -558,7 +575,7 @@ export const MAIN_COMMANDS: MainCliCommand[] = [
         serviceType: service,
         port: numberFlag(p, 'port', true) as number,
         remoteUrl: optionalFlag(p, 'remoteUrl'),
-        ssh: sshRaw ? (JSON.parse(sshRaw) as SSHCredentials) : undefined,
+        ssh,
       };
       await primeDeploySettings();
       return startDeploy(req, () => {

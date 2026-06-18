@@ -288,11 +288,25 @@ export async function withSSH<T>(
 ): Promise<T> {
   const client = new Client();
   const expected = await knownHostKey(creds.host, creds.port || 22);
-  await new Promise<void>((resolve, reject) => {
-    client.once('ready', () => resolve());
-    client.once('error', reject);
-    client.connect(buildConnectConfig(creds, expected));
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      client.once('ready', () => resolve());
+      client.once('error', reject);
+      client.connect(buildConnectConfig(creds, expected));
+    });
+  } catch (err) {
+    // L-8: a failed handshake (auth rejected, host-key mismatch, timeout)
+    // rejects before we reach the run/finally block below, leaving the ssh2
+    // Client holding a half-open socket + its event listeners. End it here so
+    // a flurry of failing connects (e.g. retrying bad creds) doesn't leak
+    // sockets and file descriptors.
+    try {
+      client.end();
+    } catch {
+      /* already closed */
+    }
+    throw err;
+  }
   try {
     return await fn(client);
   } finally {

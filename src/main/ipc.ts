@@ -21,6 +21,7 @@ import {
 } from '../shared/types';
 import { testSSHConnection } from './services/ssh';
 import { forgetHostKey } from './services/host-keys';
+import { HOSTNAME_RE, vSSHCredentials, vUUID } from './validate';
 import { publishNodeSpecs } from './services/node-specs';
 import {
   startDeploy,
@@ -83,46 +84,9 @@ import { spawn } from 'node:child_process';
 // `ipcMain.handle` returns a structured error to the caller instead of
 // silently passing malformed data into the service layer.
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const HOSTNAME_RE = /^[a-zA-Z0-9.\-:_]{1,255}$/; // permits IPv4, hostnames, IPv6 in brackets is rejected here — refused on purpose
-const USERNAME_RE = /^[a-zA-Z0-9._\-]{1,32}$/;
-
-function vUUID(id: unknown, label: string): string {
-  if (typeof id !== 'string' || !UUID_RE.test(id)) {
-    throw new Error(`Invalid ${label}: expected UUID`);
-  }
-  return id;
-}
-
-function vSSHCredentials(raw: unknown): SSHCredentials {
-  if (!raw || typeof raw !== 'object') throw new Error('Invalid SSH credentials');
-  const c = raw as Record<string, unknown>;
-  const host = String(c.host ?? '');
-  if (!HOSTNAME_RE.test(host)) throw new Error('Invalid SSH host');
-  const port = Number(c.port ?? 22);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error('Invalid SSH port');
-  }
-  const username = String(c.username ?? '');
-  if (!USERNAME_RE.test(username)) throw new Error('Invalid SSH username');
-  // password / privateKey / passphrase: pass-through. Length-bound only
-  // to avoid trivial DoS via gigabyte payloads.
-  const cap = (s: unknown, max: number) => {
-    if (s === undefined || s === null) return undefined;
-    const v = String(s);
-    if (v.length > max) throw new Error('SSH credential field too long');
-    return v;
-  };
-  return {
-    host,
-    port,
-    username,
-    password: cap(c.password, 4096),
-    privateKey: cap(c.privateKey, 32_768),
-    passphrase: cap(c.passphrase, 4096),
-  } as SSHCredentials;
-}
-
+// Validators live in ./validate so the CLI registry (cli-registry.ts) shares
+// the exact same bounds/charset checks (M-13). HOSTNAME_RE is re-used by the
+// forget-host-key handler below.
 function broadcast(channel: string, payload: unknown) {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send(channel, payload);
@@ -174,12 +138,12 @@ async function reportLocalSystem(): Promise<LocalSystemReport> {
 
 export function registerIpcHandlers(): void {
   ipcMain.handle(IPC.SYSTEM_REPORT, reportLocalSystem);
-  ipcMain.handle(IPC.SYSTEM_LIVE_STATS_START, () => {
-    startLiveStats();
+  ipcMain.handle(IPC.SYSTEM_LIVE_STATS_START, (e) => {
+    startLiveStats(e.sender);
     return { ok: true };
   });
-  ipcMain.handle(IPC.SYSTEM_LIVE_STATS_STOP, () => {
-    stopLiveStats();
+  ipcMain.handle(IPC.SYSTEM_LIVE_STATS_STOP, (e) => {
+    stopLiveStats(e.sender);
     return { ok: true };
   });
   ipcMain.handle(IPC.DOCKER_START, async () => {
@@ -342,11 +306,19 @@ export function registerIpcHandlers(): void {
   );
 
   ipcMain.handle(IPC.NODES_BACKUP_MNEMONIC, async (_e, nodeId: string, mnemonic: string) => {
+    const id = vUUID(nodeId, 'node id');
+    if (typeof mnemonic !== 'string' || !mnemonic.trim()) {
+      return { ok: false, error: 'No mnemonic to back up.' };
+    }
     if (!safeStorage.isEncryptionAvailable()) {
       return { ok: false, error: 'OS keychain unavailable — cannot back up.' };
     }
+    const blob = safeStorage.encryptString(mnemonic).toString('base64');
+    if (!blob) {
+      return { ok: false, error: 'Encryption produced an empty blob — backup aborted.' };
+    }
     const store = await readStore();
-    store.nodeBackups[nodeId] = safeStorage.encryptString(mnemonic).toString('base64');
+    store.nodeBackups[id] = blob;
     await writeStore(store);
     return { ok: true };
   });
@@ -382,8 +354,9 @@ export function registerIpcHandlers(): void {
   );
 
   ipcMain.handle(IPC.NODES_REVEAL_MNEMONIC, async (_e, nodeId: string) => {
+    const id = vUUID(nodeId, 'node id');
     const store = await readStore();
-    const blob = store.nodeBackups[nodeId];
+    const blob = store.nodeBackups[id];
     if (!blob) {
       return {
         ok: false,
@@ -455,7 +428,10 @@ export function registerIpcHandlers(): void {
         {
           detached: true,
           stdio: 'ignore',
-          windowsHide: true,
+          // Must stay false: this command's whole purpose is to surface a
+          // visible PowerShell console. windowsHide:true can propagate
+          // CREATE_NO_WINDOW to the start-launched grandchild on some builds.
+          windowsHide: false,
         },
       );
       child.on('error', (err) => log.warn('cli powershell spawn error', { err: String(err) }));
@@ -520,14 +496,23 @@ async function exportDiagnostics(targetZip: string): Promise<void> {
   );
   zip.addFile('store.json', Buffer.from(JSON.stringify(sanitizedStore, null, 2)));
   zip.addFile('settings.json', Buffer.from(JSON.stringify(settings, null, 2)));
+  let files: string[] = [];
   try {
-    const files = await fs.readdir(logDir());
-    for (const f of files) {
+    files = await fs.readdir(logDir());
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== 'ENOENT') {
+      log.warn('exportDiagnostics: could not read log dir', { err: String(err) });
+    }
+  }
+  for (const f of files) {
+    try {
       const contents = await fs.readFile(path.join(logDir(), f));
       zip.addFile(`logs/${f}`, contents);
+    } catch (err) {
+      // One unreadable/locked log file must not abort the whole bundle.
+      log.warn('exportDiagnostics: skipped log file', { file: f, err: String(err) });
     }
-  } catch {
-    /* no logs yet */
   }
   zip.writeZip(targetZip);
 }

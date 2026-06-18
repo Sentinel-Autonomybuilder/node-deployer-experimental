@@ -119,6 +119,12 @@ export interface NodeLiveStatus {
   bytesIn: number;
   /** Uptime (ms) of the node process, persisted across app restarts. */
   uptimeMs: number;
+  /**
+   * Operator-address balance (udvpn) as read on this same probe. Carried on
+   * the live-status frame so the metrics sampler records the *just-fetched*
+   * balance rather than the stale snapshot from the start of the poll tick.
+   */
+  earningsUdvpn?: number;
   chainHeight?: number;
   /** Probe latency from the app to the on-chain data source. */
   apiLatencyMs?: number;
@@ -402,6 +408,7 @@ export interface SendTxResult {
     | 'insufficient-funds'
     | 'sequence-mismatch'
     | 'invalid-address'
+    | 'invalid-amount'
     | 'timeout'
     | 'rpc-unavailable'
     | 'chain-mismatch'

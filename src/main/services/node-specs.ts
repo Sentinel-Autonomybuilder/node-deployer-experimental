@@ -350,8 +350,21 @@ export async function publishNodeSpecs(
     });
     return { ok: true, txHash };
   } catch (err) {
-    await updateNode(nodeId, { specsPublishPending: true });
     const errMsg = (err as Error).message;
+    // L-4: a publish can throw long after it started — by which point the node
+    // may have been removed (cancelled deploy, user delete). Don't re-mark a
+    // ghost node pending or log a failure event that references a node the UI
+    // no longer shows. updateNode already no-ops on a missing id; we guard the
+    // event the same way so the activity feed stays consistent.
+    const stillExists = await getNode(nodeId);
+    if (!stillExists) {
+      log.info('specs publish failed for a node that no longer exists, skipping event', {
+        nodeId,
+        err: errMsg.slice(0, 160),
+      });
+      return { ok: false, error: errMsg };
+    }
+    await updateNode(nodeId, { specsPublishPending: true });
     await addEvent({
       kind: 'specs-publish-failed',
       title: `Specs publish failed: ${node.moniker}`,
